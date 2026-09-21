@@ -30,15 +30,26 @@ fn main() {
         return;
     }
 
-    if find_agent().is_none() {
-        log("Cursor agent CLI not found. Install it, add it to PATH, then run `agent login`.");
-        std::process::exit(1);
+    match find_agent() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            log("Cursor agent CLI not found. Install it, add it to PATH, then run `agent login`.");
+            std::process::exit(1);
+        }
+        Err(err) => {
+            log(&format!("Invalid Cursor agent configuration: {err}"));
+            std::process::exit(1);
+        }
     }
 
     let claude = match find_claude() {
-        Some(command) => command,
-        None => {
+        Ok(Some(command)) => command,
+        Ok(None) => {
             log("Claude Code CLI not found. Install it and add `claude` to PATH.");
+            std::process::exit(1);
+        }
+        Err(err) => {
+            log(&format!("Invalid Claude Code configuration: {err}"));
             std::process::exit(1);
         }
     };
@@ -124,40 +135,70 @@ fn command_for_path(path: PathBuf, windows: bool) -> ResolvedCommand {
     }
 }
 
-fn first_path_from_output(output: &std::process::Output) -> Option<PathBuf> {
+fn paths_from_output(output: &std::process::Output) -> Vec<PathBuf> {
     if !output.status.success() {
-        return None;
+        return Vec::new();
     }
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
+        .filter(|line| !line.is_empty())
         .map(PathBuf::from)
+        .collect()
 }
 
-fn find_on_path(name: &str) -> Option<PathBuf> {
+fn find_on_path(name: &str) -> Vec<PathBuf> {
     #[cfg(windows)]
     {
-        let output = Command::new("where.exe").arg(name).output().ok()?;
-        first_path_from_output(&output)
+        Command::new("where.exe")
+            .arg(name)
+            .output()
+            .map(|output| paths_from_output(&output))
+            .unwrap_or_default()
     }
 
     #[cfg(not(windows))]
     {
         let command = format!("command -v {name}");
         if let Ok(output) = Command::new("sh").args(["-c", command.as_str()]).output() {
-            if let Some(path) = first_path_from_output(&output) {
-                return Some(path);
+            let paths = paths_from_output(&output);
+            if !paths.is_empty() {
+                return paths;
             }
         }
         if let Ok(output) = Command::new("which").arg(name).output() {
-            if let Some(path) = first_path_from_output(&output) {
-                return Some(path);
-            }
+            return paths_from_output(&output);
         }
 
-        None
+        Vec::new()
     }
+}
+
+fn choose_supported_command_path(
+    paths: &[PathBuf],
+    windows: bool,
+) -> Result<Option<PathBuf>, PathBuf> {
+    let mut rejected = None;
+    for path in paths {
+        if is_supported_command_path(path, windows) {
+            return Ok(Some(path.clone()));
+        }
+        rejected = Some(path.clone());
+    }
+    match rejected {
+        Some(path) => Err(path),
+        None => Ok(None),
+    }
+}
+
+fn unsupported_discovered_path_error(kind: &str, path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{kind} command was found at '{}' but cannot be launched safely because its path contains unsupported cmd.exe characters",
+            path.display()
+        ),
+    )
 }
 
 fn is_supported_command_path(path: &Path, windows: bool) -> bool {
@@ -165,30 +206,52 @@ fn is_supported_command_path(path: &Path, windows: bool) -> bool {
         return true;
     }
 
-    path.extension()
-        .and_then(OsStr::to_str)
-        .map(|ext| ext.eq_ignore_ascii_case("exe") || is_windows_script(path))
-        .unwrap_or(false)
-}
-
-fn command_from_env(var: &str) -> Option<ResolvedCommand> {
-    let path = std::env::var_os(var).map(PathBuf::from)?;
-    if !path.exists() || !is_supported_command_path(&path, cfg!(windows)) {
-        return None;
+    match path.extension().and_then(OsStr::to_str) {
+        Some(ext) if ext.eq_ignore_ascii_case("exe") => true,
+        Some(ext) if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") => {
+            !path.as_os_str().to_string_lossy().chars().any(|c| {
+                matches!(c, '%' | '^' | '&' | '|' | '<' | '>' | '(' | ')' | '!' | '"')
+                    || c.is_control()
+            })
+        }
+        _ => false,
     }
-    Some(command_for_path(path, cfg!(windows)))
 }
 
-fn find_agent() -> Option<ResolvedCommand> {
-    if let Some(command) = command_from_env("AGENT_PATH") {
-        return Some(command);
+fn command_from_env(var: &str) -> std::io::Result<Option<ResolvedCommand>> {
+    let Some(path) = std::env::var_os(var).map(PathBuf::from) else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    if !is_supported_command_path(&path, cfg!(windows)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{var} must point to a .exe, .cmd, or .bat file with no cmd.exe metacharacters"
+            ),
+        ));
+    }
+    Ok(Some(command_for_path(path, cfg!(windows))))
+}
+
+fn find_agent() -> std::io::Result<Option<ResolvedCommand>> {
+    if let Some(command) = command_from_env("AGENT_PATH")? {
+        return Ok(Some(command));
     }
 
     #[cfg(windows)]
     {
+        let mut rejected_path = None;
         for name in ["agent.exe", "agent.cmd", "agent.bat"] {
-            if let Some(path) = find_on_path(name) {
-                return Some(command_for_path(path, true));
+            let paths = find_on_path(name);
+            match choose_supported_command_path(&paths, true) {
+                Ok(Some(path)) => return Ok(Some(command_for_path(path, true))),
+                Err(path) => {
+                    rejected_path.get_or_insert(path);
+                }
+                Ok(None) => {}
             }
         }
 
@@ -196,16 +259,23 @@ fn find_agent() -> Option<ResolvedCommand> {
             let path = PathBuf::from(local_app_data)
                 .join("cursor-agent")
                 .join("agent.cmd");
-            if path.exists() {
-                return Some(command_for_path(path, true));
+            if path.is_file() {
+                if is_supported_command_path(&path, true) {
+                    return Ok(Some(command_for_path(path, true)));
+                }
+                rejected_path.get_or_insert(path);
             }
+        }
+
+        if let Some(path) = rejected_path {
+            return Err(unsupported_discovered_path_error("Cursor agent", &path));
         }
     }
 
     #[cfg(not(windows))]
     {
-        if let Some(path) = find_on_path("agent") {
-            return Some(command_for_path(path, false));
+        if let Some(path) = find_on_path("agent").into_iter().next() {
+            return Ok(Some(command_for_path(path, false)));
         }
 
         let home = std::env::var("HOME").unwrap_or_default();
@@ -215,42 +285,67 @@ fn find_agent() -> Option<ResolvedCommand> {
             "/usr/bin/agent",
         ] {
             if Path::new(loc).exists() {
-                return Some(command_for_path(PathBuf::from(loc), false));
+                return Ok(Some(command_for_path(PathBuf::from(loc), false)));
             }
         }
         if !home.is_empty() {
             let local = PathBuf::from(home).join(".local").join("bin").join("agent");
             if local.exists() {
-                return Some(command_for_path(local, false));
+                return Ok(Some(command_for_path(local, false)));
             }
         }
     }
 
-    None
+    Ok(None)
 }
 
-fn find_claude() -> Option<ResolvedCommand> {
-    if let Some(command) = command_from_env("CLAUDE_PATH") {
-        return Some(command);
+fn claude_windows_candidates(user_profile: &Path) -> Vec<PathBuf> {
+    vec![user_profile.join(".local").join("bin").join("claude.exe")]
+}
+
+fn find_claude() -> std::io::Result<Option<ResolvedCommand>> {
+    if let Some(command) = command_from_env("CLAUDE_PATH")? {
+        return Ok(Some(command));
     }
 
     #[cfg(windows)]
     {
+        let mut rejected_path = None;
         for name in ["claude.exe", "claude.cmd", "claude.bat"] {
-            if let Some(path) = find_on_path(name) {
-                return Some(command_for_path(path, true));
+            let paths = find_on_path(name);
+            match choose_supported_command_path(&paths, true) {
+                Ok(Some(path)) => return Ok(Some(command_for_path(path, true))),
+                Err(path) => {
+                    rejected_path.get_or_insert(path);
+                }
+                Ok(None) => {}
             }
+        }
+
+        if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+            for path in claude_windows_candidates(Path::new(&user_profile)) {
+                if path.is_file() {
+                    if is_supported_command_path(&path, true) {
+                        return Ok(Some(command_for_path(path, true)));
+                    }
+                    rejected_path.get_or_insert(path);
+                }
+            }
+        }
+
+        if let Some(path) = rejected_path {
+            return Err(unsupported_discovered_path_error("Claude Code", &path));
         }
     }
 
     #[cfg(not(windows))]
     {
-        if let Some(path) = find_on_path("claude") {
-            return Some(command_for_path(path, false));
+        if let Some(path) = find_on_path("claude").into_iter().next() {
+            return Ok(Some(command_for_path(path, false)));
         }
     }
 
-    None
+    Ok(None)
 }
 
 fn normalize_model(requested_model: &str) -> std::io::Result<String> {
@@ -291,30 +386,28 @@ impl Drop for Proxy {
 impl Proxy {
     fn start() -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = shutdown.clone();
 
         let thread = std::thread::Builder::new()
             .name("bridge-proxy".into())
-            .spawn(move || {
-                let _ = listener.set_nonblocking(true);
-                loop {
-                    if sd.load(Ordering::Acquire) {
-                        break;
+            .spawn(move || loop {
+                if sd.load(Ordering::Acquire) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        std::thread::Builder::new()
+                            .name("bridge-conn".into())
+                            .spawn(move || handle_connection(stream))
+                            .ok();
                     }
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            std::thread::Builder::new()
-                                .name("bridge-conn".into())
-                                .spawn(move || handle_connection(stream))
-                                .ok();
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(50))
-                        }
-                        Err(_) => break,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(50))
                     }
+                    Err(_) => break,
                 }
             })?;
 
@@ -547,7 +640,7 @@ fn build_prompt(messages: &[Message], system: &Option<serde_json::Value>) -> Str
 // ─── Agent ────────────────────────────────────────────────────
 
 fn spawn_agent(requested_model: &str) -> std::io::Result<Child> {
-    let command = find_agent().ok_or_else(|| {
+    let command = find_agent()?.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "Cursor agent CLI not found. Install it, add it to PATH, then run `agent login`",
@@ -597,6 +690,49 @@ fn join_stderr(reader: Option<std::thread::JoinHandle<String>>) -> String {
         .unwrap_or_default()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentOutcome {
+    Success,
+    UpstreamError,
+    Incomplete,
+}
+
+fn classify_agent_outcome(result_received: bool, result_is_error: bool) -> AgentOutcome {
+    if result_is_error {
+        AgentOutcome::UpstreamError
+    } else if result_received {
+        AgentOutcome::Success
+    } else {
+        AgentOutcome::Incomplete
+    }
+}
+
+fn result_event_is_error(event: &serde_json::Value) -> bool {
+    if event["is_error"].as_bool().unwrap_or(false)
+        || matches!(event["subtype"].as_str(), Some("error" | "failed"))
+    {
+        return true;
+    }
+
+    match &event["error"] {
+        serde_json::Value::Object(error) => !error.is_empty(),
+        serde_json::Value::String(error) => !error.trim().is_empty(),
+        _ => false,
+    }
+}
+
+fn result_event_error_message(event: &serde_json::Value) -> Option<String> {
+    event["error"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| event["message"].as_str().map(str::to_owned))
+        .or_else(|| event["result"].as_str().map(str::to_owned))
+}
+
+fn agent_status_failed(status: &std::io::Result<ExitStatus>) -> bool {
+    !matches!(status, Ok(exit) if exit.success())
+}
+
 fn log_agent_failure(status: &std::io::Result<ExitStatus>, stderr: &str, result_received: bool) {
     log(&format!(
         "agent status: {status:?}, result received: {result_received}"
@@ -605,6 +741,14 @@ fn log_agent_failure(status: &std::io::Result<ExitStatus>, stderr: &str, result_
         log(&format!("agent stderr: {}", stderr.trim()));
     }
     log("Cursor agent did not complete the request. Run `agent login` and try again if authentication is required.");
+}
+
+fn log_agent_exit_warning(status: &std::io::Result<ExitStatus>) {
+    if agent_status_failed(status) {
+        log(&format!(
+            "agent returned a non-success exit after a terminal result: {status:?}"
+        ));
+    }
 }
 
 fn respond_json_error(mut stream: TcpStream, status: &str, message: &str) {
@@ -650,6 +794,8 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
     let mut text = String::new();
     let mut usage = serde_json::json!({});
     let mut result_received = false;
+    let mut result_is_error = false;
+    let mut result_error_message = None;
 
     for line in reader.lines() {
         let line = match line {
@@ -671,21 +817,27 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
             }
             if event["type"] == "result" {
                 result_received = true;
+                result_is_error = result_event_is_error(&event);
+                result_error_message = result_event_error_message(&event);
                 usage = event["usage"].clone();
             }
         }
     }
     let status = agent.wait();
     let stderr = join_stderr(stderr_reader);
-    let completed = result_received && matches!(status.as_ref(), Ok(exit) if exit.success());
-    if !completed {
-        log_agent_failure(&status, &stderr, result_received);
-        respond_json_error(
-            stream,
-            "502 Bad Gateway",
-            "Cursor agent did not complete the request. Run `agent login` and try again.",
-        );
-        return;
+    match classify_agent_outcome(result_received, result_is_error) {
+        AgentOutcome::Success => log_agent_exit_warning(&status),
+        AgentOutcome::UpstreamError | AgentOutcome::Incomplete => {
+            log_agent_failure(&status, &stderr, result_received);
+            respond_json_error(
+                stream,
+                "502 Bad Gateway",
+                result_error_message.as_deref().unwrap_or(
+                    "Cursor agent did not complete the request. Run `agent login` and try again.",
+                ),
+            );
+            return;
+        }
     }
 
     let resp = serde_json::json!({
@@ -751,6 +903,8 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let reader = BufReader::new(agent.stdout.take().unwrap());
     let mut content_index = 0i32;
     let mut result_received = false;
+    let mut result_is_error = false;
+    let mut result_error_message = None;
     let mut usage = serde_json::json!({});
 
     for line in reader.lines() {
@@ -825,6 +979,8 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                 }
                 Some("result") => {
                     result_received = true;
+                    result_is_error = result_event_is_error(&event);
+                    result_error_message = result_event_error_message(&event);
                     usage = event["usage"].clone();
                 }
                 _ => {}
@@ -834,20 +990,22 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
 
     let status = agent.wait();
     let stderr = join_stderr(stderr_reader);
-    let completed = result_received && matches!(status.as_ref(), Ok(exit) if exit.success());
-    if !completed {
-        log_agent_failure(&status, &stderr, result_received);
-        let _ = write_sse(
-            &mut stream,
-            "error",
-            &serde_json::json!({
-                "type": "error",
-                "error": {"type": "api_error", "message": "Cursor agent did not complete the request. Run `agent login` and try again."}
-            }),
-        );
-        let _ = stream.write_all(b"data: [DONE]\n\n");
-        let _ = stream.flush();
-        return;
+    match classify_agent_outcome(result_received, result_is_error) {
+        AgentOutcome::Success => log_agent_exit_warning(&status),
+        AgentOutcome::UpstreamError | AgentOutcome::Incomplete => {
+            log_agent_failure(&status, &stderr, result_received);
+            let _ = write_sse(
+                &mut stream,
+                "error",
+                &serde_json::json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": result_error_message.as_deref().unwrap_or("Cursor agent did not complete the request. Run `agent login` and try again.")}
+                }),
+            );
+            let _ = stream.write_all(b"data: [DONE]\n\n");
+            let _ = stream.flush();
+            return;
+        }
     }
 
     let _ = write_sse(
@@ -965,7 +1123,7 @@ mod tests {
         // Can't assert None because `which` might find `agent` in CI,
         // but it shouldn't panic or return Some("")
         let result = find_agent();
-        if let Some(command) = result {
+        if let Ok(Some(command)) = result {
             assert!(
                 !command.program.as_os_str().is_empty(),
                 "program must not be empty"
@@ -1069,5 +1227,122 @@ mod tests {
             PathBuf::from(r"C:\Users\me\.local\bin\claude.exe")
         );
         assert!(command.prefix_args.is_empty());
+    }
+
+    #[test]
+    fn test_windows_script_paths_allow_spaces_and_reject_cmd_metacharacters() {
+        assert!(is_supported_command_path(
+            Path::new(r"C:\Program Files\Cursor\agent.cmd"),
+            true
+        ));
+        assert!(!is_supported_command_path(
+            Path::new(r"C:\Tools\safe&unsafe\agent.cmd"),
+            true
+        ));
+        assert!(!is_supported_command_path(
+            Path::new(r"C:\Tools\%TEMP%\agent.cmd"),
+            true
+        ));
+        assert!(is_supported_command_path(
+            Path::new(r"C:\Tools\claude.exe"),
+            true
+        ));
+    }
+
+    #[test]
+    fn test_result_error_detection_ignores_placeholders() {
+        assert!(!result_event_is_error(&serde_json::json!({
+            "type": "result",
+            "error": ""
+        })));
+        assert!(!result_event_is_error(&serde_json::json!({
+            "type": "result",
+            "error": "  "
+        })));
+        assert!(!result_event_is_error(&serde_json::json!({
+            "type": "result",
+            "error": null
+        })));
+        assert!(!result_event_is_error(&serde_json::json!({
+            "type": "result",
+            "error": {}
+        })));
+    }
+
+    #[test]
+    fn test_result_error_detection_requires_meaningful_error() {
+        assert!(result_event_is_error(&serde_json::json!({
+            "type": "result",
+            "error": "agent failed"
+        })));
+        assert!(result_event_is_error(&serde_json::json!({
+            "type": "result",
+            "error": {"message": "agent failed"}
+        })));
+    }
+
+    #[test]
+    fn test_command_selection_prefers_safe_candidate() {
+        let paths = vec![
+            PathBuf::from(r"C:\Unsafe&Folder\agent.cmd"),
+            PathBuf::from(r"C:\Program Files\Cursor\agent.cmd"),
+        ];
+        let selected = choose_supported_command_path(&paths, true).unwrap();
+        assert_eq!(
+            selected,
+            Some(PathBuf::from(r"C:\Program Files\Cursor\agent.cmd"))
+        );
+    }
+
+    #[test]
+    fn test_command_selection_reports_only_rejected_candidates() {
+        let paths = vec![PathBuf::from(r"C:\Unsafe&Folder\agent.cmd")];
+        let rejected = choose_supported_command_path(&paths, true).unwrap_err();
+        assert_eq!(rejected, paths[0]);
+    }
+
+    #[test]
+    fn test_claude_windows_candidate_uses_native_install_location() {
+        let candidates = claude_windows_candidates(Path::new(r"C:\Users\me"));
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from(r"C:\Users\me\.local\bin\claude.exe")]
+        );
+    }
+
+    #[test]
+    fn test_proxy_starts_and_stops_promptly() {
+        let proxy = Proxy::start().expect("proxy should start");
+        assert!(proxy.port() > 0);
+        drop(proxy);
+    }
+
+    #[test]
+    fn test_successful_result_wins_over_wrapper_exit_status() {
+        assert_eq!(classify_agent_outcome(true, false), AgentOutcome::Success);
+    }
+
+    #[test]
+    fn test_explicit_result_error_is_not_success() {
+        assert_eq!(
+            classify_agent_outcome(true, true),
+            AgentOutcome::UpstreamError
+        );
+        assert!(result_event_is_error(&serde_json::json!({
+            "type": "result",
+            "is_error": true
+        })));
+        assert!(result_event_is_error(&serde_json::json!({
+            "type": "result",
+            "subtype": "failed"
+        })));
+    }
+
+    #[test]
+    fn test_missing_result_is_incomplete_even_after_successful_exit() {
+        assert_eq!(
+            classify_agent_outcome(false, false),
+            AgentOutcome::Incomplete
+        );
     }
 }

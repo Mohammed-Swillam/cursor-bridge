@@ -5,7 +5,7 @@
 [![Crates.io](https://img.shields.io/crates/v/cursor-bridge)](https://crates.io/crates/cursor-bridge)
 [![License](https://img.shields.io/github/license/hkc5/cursor-bridge)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/hkc5/cursor-bridge)](https://github.com/hkc5/cursor-bridge)
-[![CI](https://img.shields.io/github/actions/workflow/status/hkc5/cursor-bridge/publish.yml?branch=main)](https://github.com/hkc5/cursor-bridge/actions)
+[![CI](https://img.shields.io/github/actions/workflow/status/hkc5/cursor-bridge/ci.yml?branch=main)](https://github.com/hkc5/cursor-bridge/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows%2011-blue)](.)
 
 ![demo](demo.webp)
@@ -75,9 +75,17 @@ Install Claude Code from PowerShell:
 irm https://claude.ai/install.ps1 | iex
 ```
 
+This is the official installer command, but it downloads and executes a remote PowerShell script. Review the [official installation and integrity documentation](https://code.claude.com/docs/en/setup#binary-integrity-and-code-signing) first if your environment requires verified installation. You can use the package-managed alternative instead:
+
+```powershell
+winget install Anthropic.ClaudeCode
+```
+
 The Cursor CLI currently exposes `agent.cmd`; the bridge launches it through `cmd.exe`. Claude Code is expected to be the native `claude.exe` command. Use `AGENT_PATH` or `CLAUDE_PATH` when either command is installed outside `PATH`.
 
 The bridge does not read Cursor tokens or Windows Credential Manager. Authentication is owned by the Cursor CLI, so run `agent login` when setup is incomplete or a session reports an authentication failure.
+
+Windows `.cmd` and `.bat` overrides must use ordinary filesystem paths without command-interpreter metacharacters. Native `.exe` paths are launched directly.
 
 For nonstandard installations, set the command paths in PowerShell:
 
@@ -111,7 +119,7 @@ cursor-bridge replaces `claude` entirely — it manages the proxy lifecycle inte
 
 - **Windows**: the first release targets x64 only.
 - **Authentication**: the bridge does not start `agent login` automatically.
-- **No workspace sandboxing** — the agent runs in your current directory.
+- **Workspace edits** — the agent currently runs in `%TEMP%\cursor-bridge-<process-id>`, so file-editing prompts do not operate on the current repository yet.
 - **Single account** — no multi-account rotation (yet).
 
 ## Legal

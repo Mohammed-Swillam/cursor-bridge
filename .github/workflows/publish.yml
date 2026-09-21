@@ -61,6 +61,8 @@ jobs:
         with:
           name: cursor-bridge-windows
           path: artifacts/windows
+      - name: Prepare Linux asset
+        run: chmod +x artifacts/linux/cursor-bridge
       - name: Create Release
         run: |
           gh release create "$GITHUB_REF_NAME" \
