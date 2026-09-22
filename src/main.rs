@@ -511,6 +511,13 @@ fn handle_connection(stream: TcpStream, token: &str) {
         }
     }
 
+    // Claude Code probes /api/hello without credentials; it returns a static
+    // body and never reaches the agent, so it is the one unauthenticated route.
+    if matches!(method, "GET" | "HEAD") && path == "/api/hello" {
+        respond_hello(stream, method == "HEAD");
+        return;
+    }
+
     // Reject before reading the body: unauthenticated callers never get an
     // agent spawned or a Content-Length-sized allocation.
     if !is_authorized(authorization.as_deref(), token) {
@@ -554,7 +561,6 @@ fn handle_connection(stream: TcpStream, token: &str) {
     // Claude Code appends query strings such as `?beta=true`; route on the path alone.
     let route = path.split_once('?').map_or(path, |(route, _)| route);
     match (method, route) {
-        ("HEAD", "/api/hello") | ("GET", "/api/hello") => respond_hello(stream, method == "HEAD"),
         ("GET", "/v1/models") | ("GET", "/models") => respond_models(stream),
         ("POST", "/v1/messages/count_tokens") | ("POST", "/messages/count_tokens") => {
             respond_count_tokens(stream, &body)
@@ -1463,6 +1469,17 @@ mod tests {
         );
         assert!(response.starts_with("HTTP/1.1 401"), "{response}");
         assert!(response.contains("authentication_error"));
+    }
+
+    #[test]
+    fn test_hello_probe_needs_no_token() {
+        let proxy = Proxy::start("test-token".into()).unwrap();
+        let response = send(
+            proxy.port(),
+            "GET /api/hello HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(!response.contains("Access-Control"));
     }
 
     #[test]
