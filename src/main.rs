@@ -1310,6 +1310,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn test_claude_windows_candidate_uses_native_install_location() {
         let candidates = claude_windows_candidates(Path::new(r"C:\Users\me"));
         assert_eq!(
