@@ -1311,10 +1311,12 @@ mod tests {
 
     #[test]
     fn test_claude_windows_candidate_uses_native_install_location() {
-        let candidates = claude_windows_candidates(Path::new(r"C:\Users\me"));
+        let user_profile = PathBuf::from(r"C:\Users\me");
+        let candidates = claude_windows_candidates(&user_profile);
+        let expected = user_profile.join(".local").join("bin").join("claude.exe");
         assert_eq!(
             candidates,
-            vec![PathBuf::from(r"C:\Users\me\.local\bin\claude.exe")]
+            vec![expected]
         );
     }
 
