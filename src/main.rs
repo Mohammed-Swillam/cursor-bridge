@@ -24,6 +24,13 @@ fn log(msg: &str) {
     }
 }
 
+/// User-facing error: always printed, then exit 1. Only for use before
+/// `claude` starts; once it owns the terminal, proxy errors go through `log`.
+fn fatal(msg: &str) -> ! {
+    eprintln!("cursor-bridge: {msg}");
+    std::process::exit(1);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let claude_args: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
@@ -41,42 +48,22 @@ fn main() {
     match find_agent() {
         Ok(Some(_)) => {}
         Ok(None) => {
-            log("Cursor agent CLI not found. Install it, add it to PATH, then run `agent login`.");
-            std::process::exit(1);
+            fatal("Cursor agent CLI not found. Install it, add it to PATH, then run `agent login`.")
         }
-        Err(err) => {
-            log(&format!("Invalid Cursor agent configuration: {err}"));
-            std::process::exit(1);
-        }
+        Err(err) => fatal(&format!("Invalid Cursor agent configuration: {err}")),
     }
 
     let claude = match find_claude() {
         Ok(Some(command)) => command,
-        Ok(None) => {
-            log("Claude Code CLI not found. Install it and add `claude` to PATH.");
-            std::process::exit(1);
-        }
-        Err(err) => {
-            log(&format!("Invalid Claude Code configuration: {err}"));
-            std::process::exit(1);
-        }
+        Ok(None) => fatal("Claude Code CLI not found. Install it and add `claude` to PATH."),
+        Err(err) => fatal(&format!("Invalid Claude Code configuration: {err}")),
     };
 
-    let token = match generate_token() {
-        Ok(t) => t,
-        Err(err) => {
-            log(&format!("token generation failed: {err}"));
-            std::process::exit(1);
-        }
-    };
+    let token = generate_token()
+        .unwrap_or_else(|err| fatal(&format!("could not generate session token: {err}")));
 
-    let proxy = match Proxy::start(token.clone()) {
-        Ok(p) => p,
-        Err(err) => {
-            log(&format!("proxy failed: {err}"));
-            std::process::exit(1);
-        }
-    };
+    let proxy = Proxy::start(token.clone())
+        .unwrap_or_else(|err| fatal(&format!("could not start local proxy: {err}")));
 
     let mut cmd = claude.command();
     cmd.env(
@@ -95,14 +82,11 @@ fn main() {
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(err) => {
-            log(&format!("Failed to spawn claude: {err}"));
-            log("Install Claude Code and ensure `claude` is available in PATH.");
-            std::process::exit(1);
-        }
-    };
+    let mut child = cmd.spawn().unwrap_or_else(|err| {
+        fatal(&format!(
+            "Failed to start claude: {err}. Install Claude Code and ensure `claude` is available in PATH."
+        ))
+    });
 
     let status = child.wait();
     drop(proxy);
@@ -241,7 +225,10 @@ fn command_from_env(var: &str) -> std::io::Result<Option<ResolvedCommand>> {
         return Ok(None);
     };
     if !path.exists() {
-        return Ok(None);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{var} points to '{}', which does not exist", path.display()),
+        ));
     }
     if !is_supported_command_path(&path, cfg!(windows)) {
         return Err(std::io::Error::new(
