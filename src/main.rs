@@ -11,7 +11,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 fn log(msg: &str) {
-    if std::env::var("CURSOR_BRIDGE_DEBUG").is_ok() {
+    let debug_enabled = std::env::var("CURSOR_BRIDGE_DEBUG")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if debug_enabled {
         eprintln!("bridge: {msg}");
     }
 }
