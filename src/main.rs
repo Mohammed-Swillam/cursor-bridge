@@ -182,6 +182,7 @@ fn find_on_path(name: &str) -> Vec<PathBuf> {
     }
 }
 
+#[cfg(any(windows, test))]
 fn choose_supported_command_path(
     paths: &[PathBuf],
     windows: bool,
@@ -199,6 +200,7 @@ fn choose_supported_command_path(
     }
 }
 
+#[cfg(windows)]
 fn unsupported_discovered_path_error(kind: &str, path: &Path) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
@@ -307,6 +309,7 @@ fn find_agent() -> std::io::Result<Option<ResolvedCommand>> {
     Ok(None)
 }
 
+#[cfg(windows)]
 fn claude_windows_candidates(user_profile: &Path) -> Vec<PathBuf> {
     vec![user_profile.join(".local").join("bin").join("claude.exe")]
 }
