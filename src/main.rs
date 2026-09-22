@@ -551,14 +551,33 @@ fn handle_connection(stream: TcpStream, token: &str) {
 
     log(&format!("  {} {} ({}b)", method, path, body.len()));
 
-    match (method, path) {
+    // Claude Code appends query strings such as `?beta=true`; route on the path alone.
+    let route = path.split_once('?').map_or(path, |(route, _)| route);
+    match (method, route) {
         ("HEAD", "/api/hello") | ("GET", "/api/hello") => respond_hello(stream, method == "HEAD"),
         ("GET", "/v1/models") | ("GET", "/models") => respond_models(stream),
-        ("POST", p) if p.starts_with("/v1/messages") || p.starts_with("/messages") => {
-            handle_messages(stream, &body)
+        ("POST", "/v1/messages/count_tokens") | ("POST", "/messages/count_tokens") => {
+            respond_count_tokens(stream, &body)
         }
+        ("POST", "/v1/messages") | ("POST", "/messages") => handle_messages(stream, &body),
         _ => respond_404(stream),
     }
+}
+
+/// Rough estimate (~4 bytes per token). Cursor exposes no tokenizer, and
+/// spawning an agent just to count tokens would be slow and wasteful.
+fn estimate_input_tokens(body: &[u8]) -> u64 {
+    body.len().div_ceil(4) as u64
+}
+
+fn respond_count_tokens(mut s: TcpStream, body: &[u8]) {
+    let body = serde_json::json!({ "input_tokens": estimate_input_tokens(body) }).to_string();
+    let h = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = s.write_all(h.as_bytes());
 }
 
 fn respond_404(mut s: TcpStream) {
@@ -1475,6 +1494,44 @@ mod tests {
             "POST /v1/messages?beta=true HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
         );
         assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    }
+
+    #[test]
+    fn test_estimate_input_tokens() {
+        assert_eq!(estimate_input_tokens(b""), 0);
+        assert_eq!(estimate_input_tokens(b"a"), 1);
+        assert_eq!(estimate_input_tokens(b"abcdefgh"), 2);
+        assert_eq!(estimate_input_tokens(b"abcdefghi"), 3);
+    }
+
+    #[test]
+    fn test_count_tokens_is_answered_locally() {
+        let proxy = Proxy::start("test-token".into()).unwrap();
+        let body = r#"{"model":"auto","messages":[{"role":"user","content":"hi"}]}"#;
+        let response = send(
+            proxy.port(),
+            &format!(
+                "POST /v1/messages/count_tokens?beta=true HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let json = response.split("\r\n\r\n").nth(1).unwrap();
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            value["input_tokens"].as_u64(),
+            Some(estimate_input_tokens(body.as_bytes()))
+        );
+    }
+
+    #[test]
+    fn test_unknown_messages_subpath_is_not_routed_to_agent() {
+        let proxy = Proxy::start("test-token".into()).unwrap();
+        let response = send(
+            proxy.port(),
+            "POST /v1/messages/batches HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
     }
 
     #[test]
