@@ -62,7 +62,15 @@ fn main() {
         }
     };
 
-    let proxy = match Proxy::start() {
+    let token = match generate_token() {
+        Ok(t) => t,
+        Err(err) => {
+            log(&format!("token generation failed: {err}"));
+            std::process::exit(1);
+        }
+    };
+
+    let proxy = match Proxy::start(token.clone()) {
         Ok(p) => p,
         Err(err) => {
             log(&format!("proxy failed: {err}"));
@@ -75,7 +83,7 @@ fn main() {
         "ANTHROPIC_BASE_URL",
         format!("http://127.0.0.1:{}", proxy.port()),
     );
-    cmd.env("ANTHROPIC_AUTH_TOKEN", "sk-any");
+    cmd.env("ANTHROPIC_AUTH_TOKEN", &token);
     cmd.env("ANTHROPIC_API_KEY", "");
     cmd.env("ANTHROPIC_MODEL", "auto");
     cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
@@ -377,6 +385,39 @@ fn normalize_model(requested_model: &str) -> std::io::Result<String> {
     }
 }
 
+// ─── Bridge token ─────────────────────────────────────────────
+
+/// Per-session secret shared only with the spawned `claude` process.
+fn generate_token() -> std::io::Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|err| std::io::Error::other(err.to_string()))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn bearer_token(header_value: &str) -> Option<&str> {
+    let value = header_value.trim();
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then_some(token)
+}
+
+fn is_authorized(authorization: Option<&str>, expected: &str) -> bool {
+    authorization
+        .and_then(bearer_token)
+        .map(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+        .unwrap_or(false)
+}
+
 // ─── Proxy ────────────────────────────────────────────────────
 
 struct Proxy {
@@ -395,12 +436,13 @@ impl Drop for Proxy {
 }
 
 impl Proxy {
-    fn start() -> std::io::Result<Self> {
+    fn start(token: String) -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = shutdown.clone();
+        let token: Arc<str> = Arc::from(token);
 
         let thread = std::thread::Builder::new()
             .name("bridge-proxy".into())
@@ -410,9 +452,10 @@ impl Proxy {
                 }
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        let token = token.clone();
                         std::thread::Builder::new()
                             .name("bridge-conn".into())
-                            .spawn(move || handle_connection(stream))
+                            .spawn(move || handle_connection(stream, &token))
                             .ok();
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -436,7 +479,7 @@ impl Proxy {
 }
 
 // ─── HTTP ─────────────────────────────────────────────────────
-fn handle_connection(stream: TcpStream) {
+fn handle_connection(stream: TcpStream, token: &str) {
     let mut reader = BufReader::new(&stream);
     let mut req_line = String::new();
     if reader
@@ -457,12 +500,18 @@ fn handle_connection(stream: TcpStream) {
 
     let mut content_length: usize = 0;
     let mut is_chunked = false;
+    let mut authorization = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).ok().map_or(true, |n| n == 0) || line.trim().is_empty() {
             break;
         }
         let lower = line.to_lowercase();
+        if lower.starts_with("authorization:") {
+            authorization = line
+                .split_once(':')
+                .map(|(_, value)| value.trim().to_string());
+        }
         if lower.starts_with("content-length:") {
             content_length = line
                 .split(':')
@@ -473,6 +522,21 @@ fn handle_connection(stream: TcpStream) {
         if lower.contains("transfer-encoding:") && lower.contains("chunked") {
             is_chunked = true;
         }
+    }
+
+    // Reject before reading the body: unauthenticated callers never get an
+    // agent spawned or a Content-Length-sized allocation.
+    if !is_authorized(authorization.as_deref(), token) {
+        log(&format!(
+            "  {method} {path} rejected: missing or invalid token"
+        ));
+        respond_json_error(
+            stream,
+            "401 Unauthorized",
+            "authentication_error",
+            "missing or invalid bridge token",
+        );
+        return;
     }
 
     let mut body = Vec::new();
@@ -506,14 +570,10 @@ fn handle_connection(stream: TcpStream) {
         ("POST", p) if p.starts_with("/v1/messages") || p.starts_with("/messages") => {
             handle_messages(stream, &body)
         }
-        ("OPTIONS", _) => respond_cors(stream),
         _ => respond_404(stream),
     }
 }
 
-fn respond_cors(mut s: TcpStream) {
-    let _ = s.write_all(b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\n\r\n");
-}
 fn respond_404(mut s: TcpStream) {
     let _ = s.write_all(b"HTTP/1.1 404\r\nContent-Length: 2\r\n\r\n{}");
 }
@@ -762,10 +822,10 @@ fn log_agent_exit_warning(status: &std::io::Result<ExitStatus>) {
     }
 }
 
-fn respond_json_error(mut stream: TcpStream, status: &str, message: &str) {
+fn respond_json_error(mut stream: TcpStream, status: &str, error_type: &str, message: &str) {
     let body = serde_json::json!({
         "type": "error",
-        "error": {"type": "api_error", "message": message}
+        "error": {"type": error_type, "message": message}
     })
     .to_string();
     let response = format!(
@@ -794,7 +854,12 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
     let mut agent = match spawn_agent(requested_model) {
         Ok(a) => a,
         Err(e) => {
-            respond_json_error(stream, "502 Bad Gateway", &format!("agent: {e}"));
+            respond_json_error(
+                stream,
+                "502 Bad Gateway",
+                "api_error",
+                &format!("agent: {e}"),
+            );
             return;
         }
     };
@@ -843,6 +908,7 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
             respond_json_error(
                 stream,
                 "502 Bad Gateway",
+                "api_error",
                 result_error_message.as_deref().unwrap_or(
                     "Cursor agent did not complete the request. Run `agent login` and try again.",
                 ),
@@ -889,7 +955,12 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let mut agent = match spawn_agent(requested_model) {
         Ok(a) => a,
         Err(e) => {
-            respond_json_error(stream, "502 Bad Gateway", &format!("agent: {e}"));
+            respond_json_error(
+                stream,
+                "502 Bad Gateway",
+                "api_error",
+                &format!("agent: {e}"),
+            );
             return;
         }
     };
@@ -898,7 +969,7 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let stderr_reader = take_stderr(&mut agent);
 
     // SSE response headers
-    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
+    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n");
     let _ = stream.flush();
 
     let msg_id = format!("msg_{}", std::process::id());
@@ -1324,9 +1395,118 @@ mod tests {
 
     #[test]
     fn test_proxy_starts_and_stops_promptly() {
-        let proxy = Proxy::start().expect("proxy should start");
+        let proxy = Proxy::start("test-token".into()).expect("proxy should start");
         assert!(proxy.port() > 0);
         drop(proxy);
+    }
+
+    // Sends one raw HTTP request and returns the full response. Requests on
+    // reject paths carry no body: closing a socket with unread data makes
+    // Windows reset the connection instead of delivering the response.
+    fn send(port: u16, raw: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        stream.write_all(raw.as_bytes()).expect("write");
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        response
+    }
+
+    #[test]
+    fn test_generate_token_is_random_hex() {
+        let a = generate_token().unwrap();
+        let b = generate_token().unwrap();
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn test_bearer_token_parsing() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("  Bearer abc  "), Some("abc"));
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token(""), None);
+    }
+
+    #[test]
+    fn test_is_authorized() {
+        assert!(is_authorized(Some("Bearer secret"), "secret"));
+        assert!(!is_authorized(Some("Bearer wrong"), "secret"));
+        assert!(!is_authorized(None, "secret"));
+    }
+
+    #[test]
+    fn test_proxy_rejects_missing_token() {
+        let proxy = Proxy::start("test-token".into()).unwrap();
+        let response = send(
+            proxy.port(),
+            "GET /v1/models HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        assert!(response.contains("authentication_error"));
+    }
+
+    #[test]
+    fn test_proxy_rejects_wrong_token() {
+        let proxy = Proxy::start("test-token".into()).unwrap();
+        let response = send(
+            proxy.port(),
+            "GET /v1/models HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer nope\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    }
+
+    #[test]
+    fn test_proxy_accepts_valid_token() {
+        let proxy = Proxy::start("test-token".into()).unwrap();
+        let response = send(
+            proxy.port(),
+            "GET /v1/models HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"auto\""));
+    }
+
+    #[test]
+    fn test_proxy_rejects_messages_without_token_before_spawning_agent() {
+        let proxy = Proxy::start("test-token".into()).unwrap();
+        let response = send(
+            proxy.port(),
+            "POST /v1/messages?beta=true HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+    }
+
+    #[test]
+    fn test_proxy_sends_no_cors_headers() {
+        let proxy = Proxy::start("test-token".into()).unwrap();
+        let unauthenticated = send(
+            proxy.port(),
+            "OPTIONS /v1/messages HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\n\r\n",
+        );
+        assert!(
+            unauthenticated.starts_with("HTTP/1.1 401"),
+            "{unauthenticated}"
+        );
+        let authenticated = send(
+            proxy.port(),
+            "OPTIONS /v1/messages HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\n\r\n",
+        );
+        assert!(authenticated.starts_with("HTTP/1.1 404"), "{authenticated}");
+        assert!(!authenticated.contains("Access-Control"));
     }
 
     #[test]
